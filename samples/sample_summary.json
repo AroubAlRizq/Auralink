@@ -1,1 +1,16 @@
+{
+  "meeting_id": "mtg_demo",
+  "executive_summary": [
+    "Reviewed Q4 roadmap and beta schedule.",
+    "Assigned comms drafting to SPEAKER_3."
+  ],
+  "decisions": [
+    {"text":"Ship beta on 2025-11-03", "owners":["Team"], "timestamp": 12.0}
+  ],
+  "action_items": [
+    {"owner":"SPEAKER_3", "task":"Draft comms", "due":"2025-10-20", "timestamp": 30.0}
+  ],
+  "risks": [],
+  "followups": []
+}
 

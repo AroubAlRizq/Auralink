@@ -2,84 +2,125 @@
 # FOR EMBEDDINGS AND RESPONSES
 """
 Provider config used by the RAG pipeline:
-- Embeddings: OpenAI (default) or local Sentence-Transformers
-- LLM answerer: OpenAI Chat (grounded QA)
+- Embeddings: OpenAI (default; reads OPENAI_* envs, or falls back to EMBEDDINGS_*)
+- LLM answerer: OpenAI Chat (reads OPENAI_* envs, or falls back to LLM_*)
 
-Env vars (.env):
-  EMBEDDINGS_PROVIDER=openai|local
-  OPENAI_API_KEY=...
-  OPENAI_EMBED_MODEL=text-embedding-3-large
-  OPENAI_MODEL=gpt-4o-mini
-  PGVECTOR_DIM=3072           # must match the embedding model dimensionality
+Option B: you can keep your generic .env names and add:
+  OPENAI_API_KEY=${EMBEDDINGS_API_KEY}
+  OPENAI_EMBED_MODEL=${EMBEDDINGS_MODEL}
+
+Required envs (with Option B mapping):
+  # Vectors / DB
+  PGVECTOR_DIM=3072                 # must match embedding size
+
+  # Embeddings (OpenAI)
+  OPENAI_API_KEY=...                # or EMBEDDINGS_API_KEY
+  OPENAI_EMBED_MODEL=text-embedding-3-large  # or EMBEDDINGS_MODEL
+
+  # Answer LLM (OpenAI)
+  OPENAI_MODEL=gpt-4o-mini          # or LLM_MODEL
 """
 
 import os
 from typing import List
 
-# ---------- Embeddings ----------
+# -------------------- Helpers to read envs with Option-B fallbacks -------------------- #
+
+def _get_env(*names: str, default: str | None = None) -> str | None:
+    """Return the first set environment variable among names, else default."""
+    for n in names:
+        v = os.getenv(n)
+        if v not in (None, ""):
+            return v
+    return default
+
+def _embedding_cfg():
+    # Prefer OPENAI_*; fallback to generic EMBEDDINGS_*
+    api_key = _get_env("OPENAI_API_KEY", "EMBEDDINGS_API_KEY")
+    model   = _get_env("OPENAI_EMBED_MODEL", "EMBEDDINGS_MODEL", default="text-embedding-3-large")
+    return api_key, model
+
+def _llm_cfg():
+    api_key = _get_env("OPENAI_API_KEY", "LLM_API_KEY")
+    model   = _get_env("OPENAI_MODEL", "LLM_MODEL", default="gpt-4o-mini")
+    return api_key, model
+
+def _pgvector_dim() -> int:
+    # PGVECTOR_DIM should match the actual embedding size
+    dim = _get_env("PGVECTOR_DIM", default=None)
+    if dim:
+        return int(dim)
+    # If not set, infer from model name (best effort)
+    _, model = _embedding_cfg()
+    if "text-embedding-3-large" in model:
+        return 3072
+    if "text-embedding-3-small" in model or "text-embedding-ada-002" in model:
+        return 1536
+    # Sensible default; change if you use a different provider
+    return 3072
+
+# -------------------- Embeddings (OpenAI) -------------------- #
+
 class BaseEmbedder:
     dim: int
     def embed(self, texts: List[str]) -> List[List[float]]:
         raise NotImplementedError
 
 class OpenAIEmbedder(BaseEmbedder):
-    def __init__(self):
+    def __init__(self, api_key: str, model: str):
+        if not api_key:
+            raise RuntimeError("OpenAI embeddings key missing. Set OPENAI_API_KEY (or EMBEDDINGS_API_KEY).")
         from openai import OpenAI
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
-        # Known dims (update if you switch models)
-        self.dim = 3072 if "3-large" in self.model else 1536
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        # Infer known dims; adjust if you switch models
+        if "text-embedding-3-large" in model:
+            self.dim = 3072
+        elif "text-embedding-3-small" in model or "text-embedding-ada-002" in model:
+            self.dim = 1536
+        else:
+            # fallback to PGVECTOR_DIM if provided, otherwise 3072
+            self.dim = _pgvector_dim()
 
     def embed(self, texts: List[str]) -> List[List[float]]:
-        # OpenAI handles batching internally for small lists; for large, chunk yourself.
+        # For large batches, you may want to split into chunks
         resp = self.client.embeddings.create(model=self.model, input=texts)
         return [d.embedding for d in resp.data]
 
-class LocalSTEmbedder(BaseEmbedder):
-    def __init__(self):
-        # Multilingual, good default. Change if you prefer another.
-        from sentence_transformers import SentenceTransformer
-        model_id = os.getenv("LOCAL_EMBED_MODEL", "intfloat/multilingual-e5-large")
-        self.model = SentenceTransformer(model_id)
-        # Common dims: e5-large=1024, e5-base=768, bge-m3=1024 (pooled)
-        self.dim = int(os.getenv("PGVECTOR_DIM", "1024"))
+# Single embedder instance used by indexer/retriever
+_openai_key, _openai_embed_model = _embedding_cfg()
+embed_model: BaseEmbedder = OpenAIEmbedder(_openai_key, _openai_embed_model)
 
-    def embed(self, texts: List[str]) -> List[List[float]]:
-        # Tip: E5 expects "query: ..." / "passage: ..." prefixes; optional for quick start.
-        return self.model.encode(texts, normalize_embeddings=True).tolist()
+# -------------------- Grounded answer LLM (OpenAI) -------------------- #
 
-def _make_embedder() -> BaseEmbedder:
-    provider = os.getenv("EMBEDDINGS_PROVIDER", "openai").lower()
-    if provider == "openai":
-        return OpenAIEmbedder()
-    elif provider in {"local", "sentence-transformers", "st"}:
-        return LocalSTEmbedder()
-    else:
-        raise ValueError(f"Unsupported EMBEDDINGS_PROVIDER: {provider}")
-
-embed_model: BaseEmbedder = _make_embedder()
-
-# Runtime sanity check so pgvector dim matches what we store
-def embedding_dim() -> int:
-    return getattr(embed_model, "dim", int(os.getenv("PGVECTOR_DIM", "3072")))
-
-# ---------- Grounded answer LLM ----------
 def llm_answer(question: str, context: str) -> str:
     """
     Compose a concise answer strictly from `context`.
     The caller builds `context` with numbered snippets (e.g., [1], [2]) + timestamps.
     """
+    api_key, chat_model = _llm_cfg()
+    if not api_key:
+        raise RuntimeError("OpenAI chat key missing. Set OPENAI_API_KEY (or LLM_API_KEY).")
+
     from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = OpenAI(api_key=api_key)
+
     system = (
         "You are a helpful meeting assistant. Answer using ONLY the provided snippets. "
         "Cite snippet numbers like [1], [2]. If the answer is not in the snippets, say you don't know."
     )
     user = f"Snippets:\n{context}\n\nQuestion: {question}"
+
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=chat_model,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
         temperature=0,
     )
     return resp.choices[0].message.content
+
+# -------------------- Public helpers -------------------- #
+
+def embedding_dim() -> int:
+    """Expose the effective embedding dimension (for schema checks)."""
+    return getattr(embed_model, "dim", _pgvector_dim())

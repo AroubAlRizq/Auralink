@@ -1,0 +1,38 @@
+DATABASE_URL Format Guide
+========================
+
+INCORRECT FORMAT (with placeholders):
+❌ DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres
+
+CORRECT FORMAT (actual values):
+✅ DATABASE_URL=postgresql://postgres:your_actual_password@db.abcdefghijklmn.supabase.co:5432/postgres
+
+How to get the correct format:
+-------------------------------
+
+1. Go to Supabase Dashboard
+2. Click "Project Settings" (gear icon)
+3. Click "Database" tab
+4. Scroll to "Connection string"
+5. Select "URI" mode
+6. Copy the full string
+7. Replace [YOUR-PASSWORD] with your actual database password
+
+Example with real values (not real credentials):
+------------------------------------------------
+DATABASE_URL=postgresql://postgres:mySecurePassword123@db.xyzprojectref.supabase.co:5432/postgres
+
+IMPORTANT:
+- Remove ALL brackets [ ] from the URL
+- Replace placeholders with actual values
+- Use your database password (not your account password)
+- The project ref is in your Supabase URL (e.g., xyzprojectref.supabase.co)
+
+Where to find your database password:
+-------------------------------------
+If you don't remember it:
+1. Go to Supabase Dashboard
+2. Project Settings → Database
+3. Click "Reset database password"
+4. Save the new password and update your .env file
+

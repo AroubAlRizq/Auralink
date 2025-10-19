@@ -5,6 +5,7 @@ import os, tempfile, uuid, json
 
 from app.utils.db import DB
 from app.models.video_audio_summarizer import summarize_video as mm_summarize
+from app.rag.composer import summarize_meeting_json
 
 
 # (Optional) multimodal narration indexer (see Step 3)

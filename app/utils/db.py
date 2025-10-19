@@ -1,8 +1,16 @@
-# app/utils/db.py
 import os
-from sqlalchemy import text
-# Reuse your engine/session from the existing module:
-from ..schemas.db import engine  # or SessionLocal/async engine if you have it
+from typing import Optional
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from dotenv import load_dotenv
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
 
 class DB:
     def __init__(self):

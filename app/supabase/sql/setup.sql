@@ -1,4 +1,4 @@
--- Complete Supabase Setup SQL
+-- Complete Supabase Setup SQL (CORRECTED VERSION)
 -- Run this script in your Supabase SQL Editor to set up the complete schema
 
 -- ============================================================================
@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS meetings (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     
-    -- Status should be one of: uploaded, asr_started, asr_done, indexed, summarized, error
     CONSTRAINT meetings_status_check CHECK (status IN ('uploaded', 'asr_started', 'asr_done', 'indexed', 'summarized', 'error'))
 );
 
@@ -40,7 +39,6 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     
-    -- Kind should be one of: upload, narration, summary, other
     CONSTRAINT files_kind_check CHECK (kind IN ('upload', 'narration', 'summary', 'other'))
 );
 
@@ -60,12 +58,15 @@ CREATE TABLE IF NOT EXISTS chunks (
     id BIGSERIAL PRIMARY KEY,
     meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     speaker TEXT,
-    start_seconds DOUBLE PRECISION NOT NULL,
-    end_seconds DOUBLE PRECISION NOT NULL,
+    start_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    end_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
     topic TEXT,
     text TEXT NOT NULL,
     embedding vector(3072),  -- 3072 for text-embedding-3-large
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+    source TEXT DEFAULT 'transcript',  -- ⭐ ADDED: transcript, multimodal, summary
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    
+    CONSTRAINT chunks_source_check CHECK (source IN ('transcript', 'multimodal', 'summary'))
 );
 
 -- Summaries table (structured meeting summaries)
@@ -88,7 +89,6 @@ CREATE TABLE IF NOT EXISTS asr_jobs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     
-    -- Status should be one of: queued, processing, completed, error
     CONSTRAINT asr_jobs_status_check CHECK (status IN ('queued', 'processing', 'completed', 'error'))
 );
 
@@ -112,6 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_utterances_meeting_start ON utterances(meeting_id
 CREATE INDEX IF NOT EXISTS idx_chunks_meeting_id ON chunks(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_meeting_start ON chunks(meeting_id, start_seconds);
 CREATE INDEX IF NOT EXISTS idx_chunks_topic ON chunks(topic);
+CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);  -- ⭐ ADDED
 
 -- ASR Jobs indexes
 CREATE INDEX IF NOT EXISTS idx_asr_jobs_meeting_id ON asr_jobs(meeting_id);
@@ -119,7 +120,25 @@ CREATE INDEX IF NOT EXISTS idx_asr_jobs_status ON asr_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_asr_jobs_provider ON asr_jobs(provider);
 
 -- ============================================================================
--- 4. Create Triggers for Auto-updating timestamps
+-- 4. Create Vector Index for Semantic Search (⭐ ADDED)
+-- ============================================================================
+
+-- IVFFlat index for approximate nearest neighbor search
+-- Note: This works best with at least 1000 rows
+-- For small datasets during development, Postgres will use sequential scan anyway
+
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_cosine 
+ON chunks 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- If you have Supabase with HNSW support (better performance):
+-- CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw 
+-- ON chunks 
+-- USING hnsw (embedding vector_cosine_ops);
+
+-- ============================================================================
+-- 5. Create Triggers for Auto-updating timestamps
 -- ============================================================================
 
 -- Function to update updated_at timestamp
@@ -153,14 +172,15 @@ CREATE TRIGGER update_asr_jobs_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
--- 5. Create Functions for Semantic Search
+-- 6. Create Functions for Semantic Search (⭐ UPDATED)
 -- ============================================================================
 
 -- Function to search chunks by similarity (for a specific meeting)
 CREATE OR REPLACE FUNCTION match_chunks(
   query_embedding vector(3072),
   p_meeting_id uuid,
-  match_count int DEFAULT 5
+  match_count int DEFAULT 5,
+  similarity_threshold double precision DEFAULT 0.5
 )
 RETURNS TABLE (
   id bigint,
@@ -170,8 +190,7 @@ RETURNS TABLE (
   end_seconds double precision,
   topic text,
   text text,
-  embedding vector(3072),
-  created_at timestamp with time zone,
+  source text,  -- ⭐ ADDED
   similarity double precision
 )
 LANGUAGE plpgsql
@@ -186,26 +205,54 @@ BEGIN
     chunks.end_seconds,
     chunks.topic,
     chunks.text,
-    chunks.embedding,
-    chunks.created_at,
-    1 - (chunks.embedding <=> query_embedding) AS similarity
+    chunks.source,  -- ⭐ ADDED
+    1 - (chunks.embedding <=> query_embedding) AS similarity  -- Cosine similarity
   FROM chunks
   WHERE chunks.meeting_id = p_meeting_id
     AND chunks.embedding IS NOT NULL
+    AND (1 - (chunks.embedding <=> query_embedding)) > similarity_threshold  -- Filter by threshold
   ORDER BY chunks.embedding <=> query_embedding
   LIMIT match_count;
 END;
 $$;
 
 -- ============================================================================
+-- 7. Create Helper Views (Optional but useful)
+-- ============================================================================
+
+-- View to see meeting overview with counts
+CREATE OR REPLACE VIEW meeting_overview AS
+SELECT 
+    m.id,
+    m.title,
+    m.status,
+    m.created_at,
+    COUNT(DISTINCT u.id) as utterance_count,
+    COUNT(DISTINCT c.id) as chunk_count,
+    EXISTS(SELECT 1 FROM summaries s WHERE s.meeting_id = m.id) as has_summary
+FROM meetings m
+LEFT JOIN utterances u ON u.meeting_id = m.id
+LEFT JOIN chunks c ON c.meeting_id = m.id
+GROUP BY m.id, m.title, m.status, m.created_at
+ORDER BY m.created_at DESC;
+
+-- ============================================================================
 -- Setup Complete!
 -- ============================================================================
 
+SELECT 'Setup completed successfully! ✅' as status;
+
 -- Show all tables
-SELECT 'Setup completed successfully!' as status;
+SELECT 'Tables created:' as info;
 SELECT table_name 
 FROM information_schema.tables 
 WHERE table_schema = 'public' 
   AND table_type = 'BASE TABLE'
 ORDER BY table_name;
 
+-- Show all indexes
+SELECT 'Indexes created:' as info;
+SELECT schemaname, tablename, indexname
+FROM pg_indexes
+WHERE schemaname = 'public'
+ORDER BY tablename, indexname;

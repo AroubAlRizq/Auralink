@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, AnyUrl
 import os
-from ..schemas.db import DB
+from ..utils.db import DB
 from ..utils.asr_clients import start_asr_job
 
 router = APIRouter(tags=["ingest"])

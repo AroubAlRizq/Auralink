@@ -190,7 +190,12 @@ def summarize_video(
     fps: int = 2,
     window_s: int = 30,
     max_imgs_per_chunk: int = 60,
-    model_name: str = None
+    model_name: str = None,
+    meeting_id: Optional[str] = None,
+    title: Optional[str] = None,
+    video_url: Optional[str] = None,
+    consent: bool = False,
+    upload_to_storage: bool = True  # NEW: Control video upload
 ) -> Dict:
     """
     Orchestrates the whole process and returns:
@@ -198,9 +203,81 @@ def summarize_video(
       "narration_file": ".../video_audio_narration.txt",
       "summary_file":   ".../video_audio_summary.txt",
       "windows": [ {window, start, end, frames, text}, ... ],
-      "summary_text": "<global summary string>"
+      "summary_text": "<global summary string>",
+      "meeting_id": "<uuid>",
+      "storage_path": "meeting_id/video.mp4",  # NEW
+      "storage_url": "https://..."  # NEW
     }
     """
+    # Initialize Supabase services if meeting tracking is needed
+    supabase_enabled = False
+    meeting_service = None
+    summary_service = None
+    storage_service = None
+    
+    if meeting_id or title:
+        try:
+            from app.supabase.client import get_client
+            from app.supabase.services.meeting_service import MeetingService
+            from app.supabase.services.summary_service import SummaryService
+            from app.supabase.services.storage_service import StorageService  # NEW
+            
+            client = get_client()
+            meeting_service = MeetingService(client)
+            summary_service = SummaryService(client)
+            storage_service = StorageService(client)  # NEW
+            supabase_enabled = True
+        except Exception as e:
+            print(f"Warning: Supabase not available: {e}", file=sys.stderr)
+    
+    # Create meeting record if title is provided and no meeting_id
+    if supabase_enabled and not meeting_id and title:
+        try:
+            meeting = meeting_service.create_meeting(
+                title=title,
+                video_url=video_url,
+                consent=consent,
+                status="processing"
+            )
+            meeting_id = meeting['id']
+            print(f"Created meeting record: {meeting_id}", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Failed to create meeting: {e}", file=sys.stderr)
+            supabase_enabled = False
+    
+    # NEW: Upload video to Supabase Storage
+    storage_path = None
+    storage_url = None
+    if supabase_enabled and meeting_id and upload_to_storage and storage_service:
+        try:
+            print(f"Uploading video to Supabase Storage...", file=sys.stderr)
+            upload_result = storage_service.upload_video(
+                file_path=video_path,
+                meeting_id=meeting_id,
+                original_filename=Path(video_path).name
+            )
+            storage_path = upload_result['path']
+            storage_url = upload_result['url']
+            
+            # Update meeting record with storage URL
+            meeting_service.update_meeting(
+                meeting_id,
+                {
+                    "video_url": storage_url,
+                    "storage_path": storage_path
+                }
+            )
+            print(f"Video uploaded: {storage_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Failed to upload video to storage: {e}", file=sys.stderr)
+    
+    # Update status to processing if we have a meeting_id
+    if supabase_enabled and meeting_id:
+        try:
+            meeting_service.update_status(meeting_id, "processing")
+        except Exception as e:
+            print(f"Warning: Failed to update status: {e}", file=sys.stderr)
+    
     check_ffmpeg()
 
     video_path = str(Path(video_path).resolve())
@@ -291,8 +368,33 @@ NARRATION END
     summary_path = workdir_p / "video_audio_summary.txt"
     summary_path.write_text(final, encoding="utf-8")
 
+    # Store summary in Supabase and update status
+    if supabase_enabled and meeting_id:
+        try:
+            # Store the summary
+            summary_service.upsert_summary(
+                meeting_id=meeting_id,
+                payload={
+                    "summary_text": final,
+                    "narration_file": str(narration_path),
+                    "summary_file": str(summary_path),
+                    "windows": chunk_results,
+                    "storage_path": storage_path,  # NEW
+                    "storage_url": storage_url  # NEW
+                }
+            )
+            # Update meeting status to summarized
+            meeting_service.update_status(meeting_id, "summarized")
+            print(f"Updated meeting {meeting_id} to 'summarized' status", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Failed to store summary in Supabase: {e}", file=sys.stderr)
+            try:
+                meeting_service.update_status(meeting_id, "error")
+            except:
+                pass
+
     # Return payload for API/repository callers
-    return {
+    result = {
         "narration_file": str(narration_path),
         "summary_file": str(summary_path),
         "windows": [
@@ -306,19 +408,17 @@ NARRATION END
         ],
         "summary_text": final
     }
-
-
-# --------------------------- CLI ---------------------------
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Video+Audio summarizer with Gemini.")
-    p.add_argument("--video", required=True, help="Path to input video file")
-    p.add_argument("--workdir", default="./vproc", help="Working directory (will be recreated)")
-    p.add_argument("--fps", type=int, default=2, help="Frames per second to sample (1–2 is typical)")
-    p.add_argument("--window", type=int, default=30, help="Window length in seconds")
-    p.add_argument("--max-images", type=int, default=60, help="Max images per window (safety cap)")
-    p.add_argument("--model", default=None, help="Gemini model name (overrides GEMINI_MODEL)")
-    return p.parse_args()
+    
+    if meeting_id:
+        result["meeting_id"] = meeting_id
+    
+    # NEW: Add storage info to result
+    if storage_path:
+        result["storage_path"] = storage_path
+    if storage_url:
+        result["storage_url"] = storage_url
+    
+    return result
 
 
 def main():

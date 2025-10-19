@@ -3,11 +3,14 @@ from fastapi import APIRouter, Query, UploadFile, File, Form, HTTPException
 from sqlalchemy import text as sqltext
 import os, tempfile, uuid, json
 
-from ..utils.db import DB
-from ..models.inference import summarize_meeting_json  # your text-only summarizer
+from ..rag.composer import summarize_meeting_json          # text-only summarizer lives here (llm api (for actial answer))
+from ..rag.chunking import build_index                      # indexer lives in rag/chunking.py (cohere api used here)
+from ..rag.embedder import embed_model                      # embedder lives in rag/embedder.py (used by chunking)
+                                                            # for clarification: chunking is the parent process, embedding is the child process which helps the parent
+                                                            # ie, chunking begins, segments utterences by time- speaker, chunking module then calls embedding module to create vectors
 from ..models.video_audio_summarizer import summarize_video as mm_summarize
-from ..rag.indexer import build_index  # text transcript indexer (already present)
-from ..app_config import embed_model
+from ..utils.db import DB # this is the python helper function for the asr that i told you about...my initial mess up :)
+
 # (Optional) multimodal narration indexer (see Step 3)
 try:
     from ..rag.indexer import index_mm_windows

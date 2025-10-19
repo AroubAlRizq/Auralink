@@ -43,3 +43,33 @@ async def answer_with_citations(question: str, candidates: List[Dict]) -> Dict:
     } for c in candidates]
     return {"answer": content, "citations": citations}
 
+async def summarize_meeting_json(transcript: str) -> Dict:
+    """
+    Minimal JSON summarizer using your same LLM provider.
+    """
+    if LLM_PROVIDER != "openai":
+        return {"meeting_id": None, "executive_summary": [], "decisions": [], "action_items": [], "risks": [], "followups": []}
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    prompt = (
+        "Summarize the meeting transcript into JSON with keys: "
+        "executive_summary (5-10 bullets), decisions (list of {text, timestamp}), "
+        "action_items (list of {owner, task, due, timestamp}), risks (list of strings), followups (list of strings). "
+        "Return ONLY JSON."
+    )
+    messages = [
+        {"role": "system", "content": "You are a precise meeting summarizer."},
+        {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript}"}
+    ]
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, headers=headers, json={"model": LLM_MODEL, "messages": messages, "temperature": 0})
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {"executive_summary": [text], "decisions": [], "action_items": [], "risks": [], "followups": []}
+    return data
+
+

@@ -2,10 +2,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .ingest import router as ingest_router
-from .summarize import router as summarize_router
-from .chat import router as chat_router
-from .asr_webhook import router as asr_webhook_router
+from .api.ingest import router as ingest_router
+from .api.summarize import router as summarize_router
+from .api.chat import router as chat_router
+from .api.asr_webhook import router as asr_webhook_router
+
 
 app = FastAPI(title="Meeting Storytelling API")
 

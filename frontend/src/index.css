@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+html, body, #root { height: 100%; background: #ffffff; color: #111827; }
+
+.card  { @apply bg-white border border-gray-200 rounded-xl p-6 shadow-sm hover:shadow-md transition; }
+.btn   { @apply inline-flex items-center justify-center rounded-md px-4 py-2 text-white transition; }
+.input { @apply w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none; }
+
+.btn--primary       { background-color: #4C2E91; }   /* purple */
+.btn--primary:hover { background-color: #1A237E; }   /* deep blue */
+.focus-ring-teal:focus { box-shadow: 0 0 0 2px #00BFA5 inset; }
+
+.header-bar { background-color: #4C2E91; color: #fff; }
+
+.h-title { color:#1A237E; }     /* deep purple for headers */
+
+
+.chat-bubble-ai   { @apply bg-gray-100 text-gray-900; }
+.chat-bubble-user { background:#4C2E91; color:#fff; }

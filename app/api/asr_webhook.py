@@ -1,6 +1,6 @@
 # app/api/asr_webhook.py
 from fastapi import APIRouter, Request, HTTPException
-from ..utils.db import DB
+from app.utils.db import DB
 import os
 import time
 

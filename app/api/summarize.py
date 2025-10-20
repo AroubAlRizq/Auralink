@@ -3,9 +3,19 @@ from fastapi import APIRouter, Query, UploadFile, File, HTTPException
 from sqlalchemy import text as sqltext
 import os, tempfile, uuid, json
 
-from app.utils.db import DB
-from app.rag.composer import summarize_meeting_json            # you added this async fn
+from app.rag.composer import summarize_meeting_json
 from app.models.video_audio_summarizer import summarize_video as mm_summarize
+from app.utils.db import DB
+
+# ✅ auto-index service (for summary bullets; transcript is auto-indexed in webhook)
+from app.rag.indexer_service import index_summary
+
+# Optional multimodal window indexer if you implemented it
+try:
+    from app.rag.indexer import index_mm_windows
+    HAS_MM_INDEXER = True
+except Exception:
+    HAS_MM_INDEXER = False
 
 router = APIRouter(tags=["summarize"])
 
@@ -13,32 +23,18 @@ router = APIRouter(tags=["summarize"])
 async def summarize(
     mode: str = Query("text", pattern="^(text|multimodal)$"),
     meeting_id: str | None = Query(None),
-    # For multimodal inline upload (optional)
     video_file: UploadFile | None = File(None),
     fps: int = Query(2),
     window: int = Query(30),
     max_images: int = Query(60),
-    model: str | None = Query(None),
+    model: str | None = Query(None)
 ):
-    """
-    text mode:
-      - reads utterances for meeting_id
-      - builds transcript string
-      - calls summarize_meeting_json (LLM) -> strict JSON
-      - upserts into summaries(meeting_id, payload)
-
-    multimodal mode:
-      - uses uploaded file OR meetings.video_url
-      - runs Gemini-based video+audio summarizer
-      - saves result under summaries(meeting_id, payload.multimodal)
-    """
-    db = DB()
-
     if mode == "text":
         if not meeting_id:
             raise HTTPException(400, "meeting_id is required for text mode.")
 
-        # 1) Pull transcript
+        db = DB()
+        # Build transcript from utterances
         with db.engine.begin() as con:
             rows = con.execute(sqltext("""
                 SELECT speaker, start_seconds, end_seconds, text
@@ -47,18 +43,13 @@ async def summarize(
                 ORDER BY start_seconds
             """), {"m": meeting_id}).mappings().all()
 
-        if not rows:
-            raise HTTPException(404, "No utterances found for this meeting. Run ingest/ASR first.")
+        transcript = "\n".join([f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}" for r in rows])
 
-        transcript = "\n".join(
-            f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}".strip()
-            for r in rows if r["text"]
-        )
+        # Summarize → strict JSON
+        summary_json = summarize_meeting_json(transcript)
+        summary_json["meeting_id"] = meeting_id  # helpful for downstream
 
-        # 2) Summarize (async)
-        summary_json = await summarize_meeting_json(transcript)
-
-        # 3) Upsert into summaries
+        # Upsert into summaries
         with db.engine.begin() as con:
             con.execute(sqltext("""
                 INSERT INTO summaries (meeting_id, payload)
@@ -66,10 +57,17 @@ async def summarize(
                 ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
             """), {"m": meeting_id, "p": json.dumps(summary_json)})
 
+        # ✅ Auto-index summary bullets for RAG
+        try:
+            await index_summary(meeting_id, summary_json)
+        except Exception:
+            # don't fail the API if indexing fails
+            pass
+
         return summary_json
 
-    # ---------- multimodal path ----------
-    # Resolve local video path: upload OR fetch from DB
+    # -------- multimodal path --------
+    # get local path
     if video_file:
         tmpdir = tempfile.mkdtemp(prefix="mm_")
         local_video = os.path.join(tmpdir, f"{uuid.uuid4()}_{video_file.filename}")
@@ -78,14 +76,14 @@ async def summarize(
     else:
         if not meeting_id:
             raise HTTPException(400, "Provide either video_file or meeting_id for multimodal mode.")
+        db = DB()
         with db.engine.begin() as con:
-            row = con.execute(sqltext("SELECT video_url FROM meetings WHERE id = :m"),
-                              {"m": meeting_id}).first()
+            row = con.execute(sqltext("SELECT video_url FROM meetings WHERE id = :m"), {"m": meeting_id}).first()
         if not row or not row[0]:
             raise HTTPException(400, "No stored video_url for this meeting; upload a video_file instead.")
-        local_video = row[0]  # must be accessible path or mapped URL
+        local_video = row[0]
 
-    # Run Gemini video+audio summarizer
+    # run Gemini
     try:
         res = mm_summarize(
             video_path=local_video,
@@ -93,14 +91,16 @@ async def summarize(
             fps=fps,
             window_s=window,
             max_imgs_per_chunk=max_images,
-            model_name=model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            model_name=model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         )
     except Exception as e:
         raise HTTPException(500, f"Multimodal summarization failed: {e}")
 
-    # Persist multimodal payload (if meeting_id supplied)
+    # persist multimodal summary in summaries payload (optional structure)
     if meeting_id:
+        db = DB()
         payload = {
+            "meeting_id": meeting_id,
             "executive_summary": [],
             "decisions": [],
             "action_items": [],
@@ -109,9 +109,9 @@ async def summarize(
             "multimodal": {
                 "narration_file": res["narration_file"],
                 "summary_file": res["summary_file"],
-                "windows": res["windows"],
+                "windows": res["windows"]
             },
-            "raw_summary_text": res["summary_text"],
+            "raw_summary_text": res["summary_text"]
         }
         with db.engine.begin() as con:
             con.execute(sqltext("""
@@ -119,5 +119,12 @@ async def summarize(
                 VALUES (:m, :p::jsonb)
                 ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
             """), {"m": meeting_id, "p": json.dumps(payload)})
+
+        # (optional) index multimodal windows if you have a helper
+        if HAS_MM_INDEXER:
+            try:
+                index_mm_windows(meeting_id, res["windows"])
+            except Exception:
+                pass
 
     return res

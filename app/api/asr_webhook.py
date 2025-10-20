@@ -1,7 +1,7 @@
 # app/api/asr_webhook.py
 from fastapi import APIRouter, Request, HTTPException
 from app.utils.db import DB
-import os
+from app.rag.indexer_service import index_transcript  # ✅ auto-index here
 import time
 
 router = APIRouter(tags=["webhooks"])
@@ -14,19 +14,6 @@ def _ms_to_s(v):
 
 @router.post("/asr/webhook/assemblyai")
 async def assemblyai_webhook(req: Request):
-    """
-    Expected payload (simplified):
-    {
-      "id": "job_123",
-      "status": "completed",
-      "metadata": {"meeting_id": "..."},
-      "utterances": [
-        {"speaker": "A", "start": 1234, "end": 5678, "text": "..."},
-        ...
-      ],
-      "error": "...optional..."
-    }
-    """
     payload = await req.json()
     status = payload.get("status")
     job_id = payload.get("id")
@@ -40,11 +27,9 @@ async def assemblyai_webhook(req: Request):
         raise HTTPException(500, f"ASR provider error: {payload.get('error')}")
 
     if status != "completed":
-        # Provider may send intermediate events
         db.update_asr_job(job_id, status=status, raw=payload)
         return {"ok": True}
 
-    # If meeting_id missing, try to map job to meeting
     if not meeting_id:
         meeting_id = db.meeting_id_from_job(job_id)
         if not meeting_id:
@@ -58,39 +43,33 @@ async def assemblyai_webhook(req: Request):
         end = _ms_to_s(u.get("end", start))
         text = (u.get("text") or "").strip()
         if text:
-            ulist.append({
-                "speaker": sp,
-                "start_seconds": start,
-                "end_seconds": end,
-                "text": text
-            })
+            ulist.append({"speaker": sp, "start_seconds": start, "end_seconds": end, "text": text})
 
-    # Persist
+    # Persist transcript
     if ulist:
         db.bulk_insert_utterances(meeting_id, ulist)
     db.update_meeting_status(meeting_id, "asr_done")
     db.update_asr_job(job_id, status="completed", raw=payload)
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(ulist)}
+    # ✅ Auto-index transcript for RAG
+    indexed = 0
+    try:
+        indexed = await index_transcript(meeting_id, ulist)
+    except Exception:
+        # keep webhook success even if indexing fails
+        pass
+
+    return {"ok": True, "meeting_id": meeting_id, "utterances": len(ulist), "indexed_chunks": indexed}
 
 @router.post("/asr/webhook/deepgram")
 async def deepgram_webhook(req: Request):
-    """
-    Deepgram callbacks vary; we try common shapes:
-    - paragraphs/utterances with speaker, start, end, text
-    """
     payload = await req.json()
     job_id = payload.get("request_id") or payload.get("id") or str(int(time.time()))
-    meeting_id = None
-
-    # Try metadata path
     md = payload.get("metadata") or {}
     meeting_id = md.get("meeting_id")
 
-    # Possible locations of utterances
+    # Collect utterances
     utterances = []
-
-    # v: payload["results"]["utterances"]
     try:
         for u in payload["results"]["utterances"]:
             if u.get("transcript"):
@@ -102,8 +81,6 @@ async def deepgram_webhook(req: Request):
                 })
     except Exception:
         pass
-
-    # Fallback: paragraphs
     if not utterances:
         try:
             paras = payload["results"]["channels"][0]["alternatives"][0]["paragraphs"]["paragraphs"]
@@ -119,9 +96,7 @@ async def deepgram_webhook(req: Request):
             pass
 
     db = DB()
-
     if not meeting_id:
-        # Try to map job id
         meeting_id = db.meeting_id_from_job(job_id)
         if not meeting_id:
             raise HTTPException(400, "Missing meeting_id (metadata) and no mapping found for job_id")
@@ -131,4 +106,11 @@ async def deepgram_webhook(req: Request):
     db.update_meeting_status(meeting_id, "asr_done")
     db.update_asr_job(job_id, status="completed", raw=payload)
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(utterances)}
+    # ✅ Auto-index transcript for RAG
+    indexed = 0
+    try:
+        indexed = await index_transcript(meeting_id, utterances)
+    except Exception:
+        pass
+
+    return {"ok": True, "meeting_id": meeting_id, "utterances": len(utterances), "indexed_chunks": indexed}

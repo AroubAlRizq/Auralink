@@ -87,6 +87,7 @@ class DatabaseManager:
                             utterance["text"]
                         )
                     )
+            conn.commit()
             logger.info(f"Inserted {len(utterances)} utterances for meeting {meeting_id}")
             return True
         except Exception as e:

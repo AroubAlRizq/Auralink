@@ -3,7 +3,7 @@ import httpx
 from typing import List
 
 PROVIDER = os.getenv("EMBEDDINGS_PROVIDER", "openai")
-MODEL = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-large")
+MODEL = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
 API_KEY = os.getenv("EMBEDDINGS_API_KEY")
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:

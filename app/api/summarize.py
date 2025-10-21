@@ -1,11 +1,11 @@
 # app/api/summarize.py
 from fastapi import APIRouter, Query, UploadFile, File, HTTPException
-from sqlalchemy import text as sqltext
 import os, tempfile, uuid, json
-
+import asyncio
+import random
 from app.rag.composer import summarize_meeting_json
 from app.models.video_audio_summarizer import summarize_video as mm_summarize
-from app.utils.db import DB
+from app.utils.database import DatabaseManager
 
 # ✅ auto-index service (for summary bullets; transcript is auto-indexed in webhook)
 from app.rag.indexer_service import index_summary
@@ -33,29 +33,25 @@ async def summarize(
         if not meeting_id:
             raise HTTPException(400, "meeting_id is required for text mode.")
 
-        db = DB()
-        # Build transcript from utterances
-        with db.engine.begin() as con:
-            rows = con.execute(sqltext("""
-                SELECT speaker, start_seconds, end_seconds, text
-                FROM utterances
-                WHERE meeting_id = :m
-                ORDER BY start_seconds
-            """), {"m": meeting_id}).mappings().all()
+        db = DatabaseManager()
+        
+        # Build transcript from utterances using DatabaseManager method
+        query = """
+            SELECT speaker, start_seconds, end_seconds, text
+            FROM utterances
+            WHERE meeting_id = %s
+            ORDER BY start_seconds
+        """
+        rows = db.client.execute_query(query, (meeting_id,))
 
-        transcript = "\n".join([f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}" for r in rows])
+        transcript = "\n".join([f"[{row[1]:.1f}s {row[0]}] {row[3]}" for row in rows])
 
         # Summarize → strict JSON
-        summary_json = summarize_meeting_json(transcript)
-        summary_json["meeting_id"] = meeting_id  # helpful for downstream
+        summary_json = await summarize_meeting_json(transcript)
+        summary_json["meeting_id"] = meeting_id
 
-        # Upsert into summaries
-        with db.engine.begin() as con:
-            con.execute(sqltext("""
-                INSERT INTO summaries (meeting_id, payload)
-                VALUES (:m, :p::jsonb)
-                ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
-            """), {"m": meeting_id, "p": json.dumps(summary_json)})
+        # Upsert into summaries using the existing method
+        db.upsert_summary(meeting_id, summary_json)
 
         # ✅ Auto-index summary bullets for RAG
         try:
@@ -76,12 +72,14 @@ async def summarize(
     else:
         if not meeting_id:
             raise HTTPException(400, "Provide either video_file or meeting_id for multimodal mode.")
-        db = DB()
-        with db.engine.begin() as con:
-            row = con.execute(sqltext("SELECT video_url FROM meetings WHERE id = :m"), {"m": meeting_id}).first()
-        if not row or not row[0]:
+        
+        db = DatabaseManager()
+        query = "SELECT video_url FROM meetings WHERE id = %s"
+        result = db.client.execute_query(query, (meeting_id,))
+        
+        if not result or not result[0] or not result[0][0]:
             raise HTTPException(400, "No stored video_url for this meeting; upload a video_file instead.")
-        local_video = row[0]
+        local_video = result[0][0]
 
     # run Gemini
     try:
@@ -96,9 +94,9 @@ async def summarize(
     except Exception as e:
         raise HTTPException(500, f"Multimodal summarization failed: {e}")
 
-    # persist multimodal summary in summaries payload (optional structure)
+    # persist multimodal summary in summaries payload
     if meeting_id:
-        db = DB()
+        db = DatabaseManager()
         payload = {
             "meeting_id": meeting_id,
             "executive_summary": [],
@@ -113,12 +111,9 @@ async def summarize(
             },
             "raw_summary_text": res["summary_text"]
         }
-        with db.engine.begin() as con:
-            con.execute(sqltext("""
-                INSERT INTO summaries (meeting_id, payload)
-                VALUES (:m, :p::jsonb)
-                ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
-            """), {"m": meeting_id, "p": json.dumps(payload)})
+        
+        # Use the existing upsert_summary method
+        db.upsert_summary(meeting_id, payload)
 
         # (optional) index multimodal windows if you have a helper
         if HAS_MM_INDEXER:

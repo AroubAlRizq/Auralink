@@ -1,12 +1,13 @@
 # app/api/asr_webhook.py
 from fastapi import APIRouter, Request, HTTPException
-from app.utils.db import DB
-from app.rag.indexer_service import index_transcript  # ✅ auto-index here
+from app.utils.database import DatabaseManager
+from app.rag.indexer_service import index_transcript
 import time
 
 router = APIRouter(tags=["webhooks"])
 
 def _ms_to_s(v):
+    """Convert milliseconds to seconds"""
     try:
         return float(v) / 1000.0
     except Exception:
@@ -17,19 +18,32 @@ async def assemblyai_webhook(req: Request):
     payload = await req.json()
     status = payload.get("status")
     job_id = payload.get("id")
-    metadata = payload.get("metadata") or {}
-    meeting_id = metadata.get("meeting_id")
+    
+    # Try to get meeting_id from custom header first
+    meeting_id = req.headers.get("X-Meeting-ID")
+    
+    # Fallback to metadata if header not present
+    if not meeting_id:
+        metadata_str = payload.get("metadata") or ""
+        if metadata_str:
+            try:
+                meeting_id = str(metadata_str).strip()
+            except Exception:
+                pass
 
-    db = DB()
+    db = DatabaseManager()
 
+    # Handle error status
     if status == "error":
         db.update_asr_job(job_id, status="error", error=str(payload.get("error")))
         raise HTTPException(500, f"ASR provider error: {payload.get('error')}")
 
+    # Handle non-completed status
     if status != "completed":
         db.update_asr_job(job_id, status=status, raw=payload)
         return {"ok": True}
 
+    # Get meeting_id if not in metadata
     if not meeting_id:
         meeting_id = db.meeting_id_from_job(job_id)
         if not meeting_id:
@@ -43,23 +57,35 @@ async def assemblyai_webhook(req: Request):
         end = _ms_to_s(u.get("end", start))
         text = (u.get("text") or "").strip()
         if text:
-            ulist.append({"speaker": sp, "start_seconds": start, "end_seconds": end, "text": text})
+            ulist.append({
+                "speaker": sp,
+                "start_seconds": start,
+                "end_seconds": end,
+                "text": text
+            })
 
     # Persist transcript
     if ulist:
         db.bulk_insert_utterances(meeting_id, ulist)
+    
     db.update_meeting_status(meeting_id, "asr_done")
     db.update_asr_job(job_id, status="completed", raw=payload)
 
-    # ✅ Auto-index transcript for RAG
+    # Auto-index transcript for RAG
     indexed = 0
     try:
         indexed = await index_transcript(meeting_id, ulist)
-    except Exception:
-        # keep webhook success even if indexing fails
+    except Exception as e:
+        # Keep webhook success even if indexing fails
+        print(f"Indexing failed: {e}")
         pass
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(ulist), "indexed_chunks": indexed}
+    return {
+        "ok": True,
+        "meeting_id": meeting_id,
+        "utterances": len(ulist),
+        "indexed_chunks": indexed
+    }
 
 @router.post("/asr/webhook/deepgram")
 async def deepgram_webhook(req: Request):
@@ -81,6 +107,7 @@ async def deepgram_webhook(req: Request):
                 })
     except Exception:
         pass
+    
     if not utterances:
         try:
             paras = payload["results"]["channels"][0]["alternatives"][0]["paragraphs"]["paragraphs"]
@@ -95,7 +122,8 @@ async def deepgram_webhook(req: Request):
         except Exception:
             pass
 
-    db = DB()
+    db = DatabaseManager()
+    
     if not meeting_id:
         meeting_id = db.meeting_id_from_job(job_id)
         if not meeting_id:
@@ -103,14 +131,21 @@ async def deepgram_webhook(req: Request):
 
     if utterances:
         db.bulk_insert_utterances(meeting_id, utterances)
+    
     db.update_meeting_status(meeting_id, "asr_done")
     db.update_asr_job(job_id, status="completed", raw=payload)
 
-    # ✅ Auto-index transcript for RAG
+    # Auto-index transcript for RAG
     indexed = 0
     try:
         indexed = await index_transcript(meeting_id, utterances)
-    except Exception:
+    except Exception as e:
+        print(f"Indexing failed: {e}")
         pass
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(utterances), "indexed_chunks": indexed}
+    return {
+        "ok": True,
+        "meeting_id": meeting_id,
+        "utterances": len(utterances),
+        "indexed_chunks": indexed
+    }

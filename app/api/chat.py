@@ -1,9 +1,9 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 import os, httpx
-from rag.embedder import embed_texts
-from rag.retriever import search_vectors, rerank
-from rag.composer import answer_with_citations
+from app.rag.embedder import embed_texts
+from app.rag.retriever import search_vectors, rerank
+from app.rag.composer import answer_with_citations
 
 router = APIRouter()
 

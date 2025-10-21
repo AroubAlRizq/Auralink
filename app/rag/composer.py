@@ -1,5 +1,7 @@
-import os, httpx
+import os, httpx, json
 from typing import List, Dict
+import asyncio
+import random
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER","openai")
 LLM_MODEL = os.getenv("LLM_MODEL","gpt-4o-mini")
@@ -56,20 +58,78 @@ async def summarize_meeting_json(transcript: str) -> Dict:
         "Summarize the meeting transcript into JSON with keys: "
         "executive_summary (5-10 bullets), decisions (list of {text, timestamp}), "
         "action_items (list of {owner, task, due, timestamp}), risks (list of strings), followups (list of strings). "
-        "Return ONLY JSON."
+        "Return ONLY valid JSON without any markdown formatting or code blocks."
     )
     messages = [
-        {"role": "system", "content": "You are a precise meeting summarizer."},
+        {"role": "system", "content": "You are a precise meeting summarizer. Return only valid JSON without markdown."},
         {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript}"}
     ]
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(url, headers=headers, json={"model": LLM_MODEL, "messages": messages, "temperature": 0})
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+    
+    # Retry logic for rate limits
+    max_retries = 3
+    text = None
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(url, headers=headers, json={
+                    "model": LLM_MODEL, 
+                    "messages": messages, 
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"}  # Force JSON mode
+                })
+                resp.raise_for_status()
+                text = resp.json()["choices"][0]["message"]["content"]
+                break
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:  # Rate limit
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff
+                    print(f"Rate limited, waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    # Fallback response when rate limited
+                    return {
+                        "executive_summary": ["Meeting summary unavailable due to rate limits"],
+                        "decisions": [],
+                        "action_items": [],
+                        "risks": [],
+                        "followups": []
+                    }
+            else:
+                raise
+    
+    if not text:
+        return {
+            "executive_summary": ["Failed to generate summary"],
+            "decisions": [],
+            "action_items": [],
+            "risks": [],
+            "followups": []
+        }
+    
+    # Clean up markdown code blocks if present
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]  # Remove ```json
+    if text.startswith("```"):
+        text = text[3:]  # Remove ```
+    if text.endswith("```"):
+        text = text[:-3]  # Remove ```
+    text = text.strip()
+    
+    # Parse JSON
     try:
         data = json.loads(text)
-    except Exception:
-        data = {"executive_summary": [text], "decisions": [], "action_items": [], "risks": [], "followups": []}
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON: {e}")
+        print(f"Raw text: {text[:200]}...")
+        data = {
+            "executive_summary": [text[:500]],  # Include first 500 chars as fallback
+            "decisions": [],
+            "action_items": [],
+            "risks": [],
+            "followups": []
+        }
+    
     return data
-
-

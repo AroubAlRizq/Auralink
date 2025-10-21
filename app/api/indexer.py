@@ -2,8 +2,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 import asyncpg
 import os
-from rag.embedder import embed_texts
-from rag.chunking import chunk_utterances, chunk_summary
+from app.rag.embedder import embed_texts
+from app.rag.chunking import chunk_utterances, chunk_summary
 
 router = APIRouter()
 DB = os.getenv("DATABASE_URL")

@@ -64,3 +64,7 @@ export async function listUtterances(meetingId) {
 export async function health() {
   return j("/api/health");
 }
+
+export async function getJobForMeeting(meetingId) {
+  return j(`/api/asr/job_for_meeting?meeting_id=${encodeURIComponent(meetingId)}`);
+}

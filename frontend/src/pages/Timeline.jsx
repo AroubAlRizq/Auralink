@@ -1,137 +1,134 @@
 // src/pages/Timeline.jsx
 import { useEffect, useState } from "react";
-import { getSummary, listUtterances } from "../lib/api";
+import { getSummary } from "../lib/api";
+
+const icons = {
+  lightning: (
+    <svg viewBox="0 0 24 24" className="w-5 h-5">
+      <path fill="currentColor" d="M13 3L4 14h6l-1 7 9-11h-6l1-7Z" />
+    </svg>
+  ),
+  list: (
+    <svg viewBox="0 0 24 24" className="w-5 h-5">
+      <path fill="currentColor" d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z" />
+    </svg>
+  ),
+  check: (
+    <svg viewBox="0 0 24 24" className="w-5 h-5">
+      <path fill="currentColor" d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4Z" />
+    </svg>
+  ),
+  flag: (
+    <svg viewBox="0 0 24 24" className="w-5 h-5">
+      <path fill="currentColor" d="M6 3v18H4V3h2Zm14 2-6 2-6-2v11l6 2 6-2V5Z" />
+    </svg>
+  ),
+};
+
+function SectionCard({ title, icon, items, badgeCount }) {
+  const isEmpty =
+    !items ||
+    (Array.isArray(items) && items.length === 0) ||
+    (typeof items === "string" && !items.trim());
+  if (isEmpty) return null;
+
+  return (
+    <div className="rounded-3xl border border-[#E0D6FA] bg-white shadow-sm hover:shadow-md transition">
+      {/* Header section */}
+      <div className="flex justify-between items-center px-5 py-4 border-b border-[#E5DCFB]">
+        <div className="flex items-center gap-2 text-[#4C2E91] font-semibold">
+          <div className="bg-[#F3F0FF] rounded-xl p-2 shadow-sm">{icon}</div>
+          {title}
+        </div>
+        {badgeCount > 0 && (
+          <span className="bg-[#F3F0FF] text-[#4C2E91] text-xs px-3 py-1 rounded-full font-semibold shadow-sm">
+            {badgeCount}
+          </span>
+        )}
+      </div>
+
+      {/* Content */}
+      <div className="px-6 py-5">
+        {title === "Overview" ? (
+          <p className="text-gray-700 leading-7">{items}</p>
+        ) : (
+          <ul className="list-disc pl-5 space-y-2 text-gray-700">
+            {items.map((x, i) => (
+              <li key={i}>{x}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export default function Timeline() {
   const [summary, setSummary] = useState(null);
-  const [utterances, setUtterances] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState("");
-  const [raw, setRaw] = useState(null); // debug
 
   useEffect(() => {
-    const meetingId = localStorage.getItem("meetingId");
     const cached = localStorage.getItem("summaryPreview");
-    if (cached) { try { setSummary(JSON.parse(cached)); } catch {} }
-
-    if (!meetingId) {
-      setErr("No meeting selected. Upload a meeting on the Dashboard.");
-      setLoading(false);
-      return;
-    }
-
-    (async () => {
+    if (cached) {
       try {
-        const s = await getSummary(meetingId);
-        setRaw(s);
-        let normalized = s || {};
-        if (!("overview" in normalized || "key_points" in normalized || "decisions" in normalized || "action_items" in normalized)) {
-          const exec = Array.isArray(s?.executive_summary) ? s.executive_summary.join(" ") : (s?.executive_summary || s?.overview || s?.raw_summary_text || "");
-          const kp = Array.isArray(s?.key_points) ? s.key_points : (Array.isArray(s?.key_events) ? s.key_events : []);
-          normalized = {
-            overview: exec,
-            key_points: kp,
-            decisions: Array.isArray(s?.decisions) ? s.decisions : [],
-            action_items: Array.isArray(s?.action_items) ? s.action_items : [],
-          };
-        }
-
-        // NEW: if still empty, drop the cache so we don't keep blank state
-        const isEmpty =
-          !normalized.overview &&
-          (!normalized.key_points?.length) &&
-          (!normalized.decisions?.length) &&
-          (!normalized.action_items?.length);
-
-        if (isEmpty) {
-          localStorage.removeItem("summaryPreview");
-        } else {
-          setSummary(normalized);
-          localStorage.setItem("summaryPreview", JSON.stringify(normalized));
-        }
-
-        // also fetch utterances for context
-        try {
-          const u = await listUtterances(meetingId);
-          setUtterances(Array.isArray(u?.utterances) ? u.utterances : []);
-        } catch {}
-      } catch (e) {
-        // NEW: friendly message for the 409 we return server-side
-        const msg = String(e?.message || "");
-        if (msg.includes("No utterances found")) {
-          setErr("No transcript yet for this meeting. Please upload/ingest and wait for transcription to finish, then try again.");
-        } else {
-          setErr(msg || "Failed to load summary");
-        }
-      } finally {
-        setLoading(false);
-      }
-    })();
+        setSummary(JSON.parse(cached));
+      } catch {}
+    } else {
+      const meetingId = localStorage.getItem("meetingId");
+      if (meetingId) getSummary(meetingId).then(setSummary).catch(() => {});
+    }
   }, []);
 
+  const meetingTitle = localStorage.getItem("meetingTitle") || "Conversation Timeline";
+
+  const counts = {
+    kp: summary?.key_points?.length || 0,
+    dc: summary?.decisions?.length || 0,
+    ai: summary?.action_items?.length || 0,
+  };
+  const totalPoints = counts.kp + counts.dc + counts.ai;
+  const subtitle = `${totalPoints} summary point${totalPoints === 1 ? "" : "s"}`;
+
   return (
-    <div className="max-w-6xl mx-auto py-10 px-6">
-      <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-6">
-        <h2 className="text-2xl font-semibold text-[#4C2E91] mb-4">Conversation Timeline</h2>
+    <div className="page">
+      {/* Header */}
+      <div className="page-header">
+        <h1 className="page-header-title">{meetingTitle}</h1>
+        <p className="page-header-subtitle">{subtitle}</p>
+      </div>
 
-        <div className="min-h-[360px] rounded-md border border-gray-200 bg-white p-4 text-gray-800 leading-relaxed space-y-4">
-          {loading && <div className="text-gray-500">Loading…</div>}
-          {err && <div className="text-red-600 text-sm">{err}</div>}
+      {/* Overview */}
+      <SectionCard title="Overview" icon={icons.lightning} items={summary?.overview || ""} />
 
-          {!loading && !err && summary && (
-            <>
-              {summary.overview && (
-                <section>
-                  <div className="font-semibold text-gray-700 mb-1">Overview</div>
-                  <p>{summary.overview}</p>
-                </section>
-              )}
+      {/* Details grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <SectionCard
+          title="Key Points"
+          icon={icons.list}
+          items={summary?.key_points || []}
+          badgeCount={counts.kp}
+        />
+        {counts.dc > 0 && (
+          <SectionCard
+            title="Decisions"
+            icon={icons.flag}
+            items={summary?.decisions || []}
+            badgeCount={counts.dc}
+          />
+        )}
+        <SectionCard
+          title="Action Items"
+          icon={icons.check}
+          items={(summary?.action_items || []).map((x) => x?.task ?? x)}
+          badgeCount={counts.ai}
+        />
+      </div>
 
-              {Array.isArray(summary.key_points) && summary.key_points.length > 0 && (
-                <section>
-                  <div className="font-semibold text-gray-700 mb-1">Key Points</div>
-                  <ul className="list-disc ml-5">
-                    {summary.key_points.map((p, i) => <li key={i}>{String(p)}</li>)}
-                  </ul>
-                </section>
-              )}
-
-              {Array.isArray(summary.decisions) && summary.decisions.length > 0 && (
-                <section>
-                  <div className="font-semibold text-gray-700 mb-1">Decisions</div>
-                  <ul className="list-disc ml-5">
-                    {summary.decisions.map((d, i) => <li key={i}>{String(d)}</li>)}
-                  </ul>
-                </section>
-              )}
-
-              {Array.isArray(summary.action_items) && summary.action_items.length > 0 && (
-                <section>
-                  <div className="font-semibold text-gray-700 mb-1">Action Items</div>
-                  <ul className="list-disc ml-5">
-                    {summary.action_items.map((a, i) => <li key={i}>{String(a?.task || a)}</li>)}
-                  </ul>
-                </section>
-              )}
-
-              <details className="mt-4">
-                <summary className="cursor-pointer text-sm text-gray-500">Debug: raw summary JSON</summary>
-                <pre className="text-xs bg-gray-50 p-2 rounded border overflow-auto max-h-64">
-                  {JSON.stringify(raw ?? summary, null, 2)}
-                </pre>
-                {utterances?.length ? (
-                  <div className="text-xs text-gray-600 mt-2">Utterances saved: {utterances.length}</div>
-                ) : (
-                  <div className="text-xs text-gray-600 mt-2">No utterances found (summary may be language-model inferred).</div>
-                )}
-              </details>
-            </>
-          )}
-
-          {!loading && !err && !summary && (
-            <div className="text-gray-500">No summary yet — upload a meeting on the Dashboard.</div>
-          )}
-        </div>
+      {/* Footer */}
+      <div className="text-center text-xs text-gray-400 pt-4">
+        <hr className="mb-4 border-gray-200" />
+        <p>
+          © 2025 <span className="font-semibold text-[#5B21B6]">Auralink</span>. All rights reserved.
+        </p>
       </div>
     </div>
   );

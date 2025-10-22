@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Query, HTTPException
 from sqlalchemy import text as sqltext
 from sqlalchemy.exc import IntegrityError
-import os, json
+import os, json, asyncio
+import httpx
 
 from app.rag.composer import summarize_meeting_json
 from app.utils.db import DB
@@ -12,15 +13,6 @@ try:
     HAS_INDEXER = True
 except Exception:
     HAS_INDEXER = False
-
-# --- Optional: only used if you want a fallback without utterances
-USE_GEMINI_FALLBACK = os.getenv("USE_GEMINI_FALLBACK", "false").lower() in {"1","true","yes"}
-if USE_GEMINI_FALLBACK:
-    try:
-        from app.models.video_audio_summarizer import summarize_video
-    except Exception:
-        summarize_video = None
-        USE_GEMINI_FALLBACK = False
 
 router = APIRouter(tags=["summarize"])
 
@@ -42,8 +34,32 @@ def _normalize_summary(payload: dict) -> dict:
 
     decisions = payload.get("decisions") if isinstance(payload.get("decisions"), list) else []
     action_items = payload.get("action_items") if isinstance(payload.get("action_items"), list) else []
-
     return {"overview": overview, "key_points": key_points, "decisions": decisions, "action_items": action_items}
+
+async def _summarize_with_retries(transcript: str, attempts=(0.5, 1.0, 2.0, 4.0)):
+    """
+    Call summarize_meeting_json with small exponential backoff on rate limits (429) and transient 5xx.
+    Returns a dict payload (may be empty on final failure).
+    """
+    last_err = None
+    for i, delay in enumerate(attempts, 1):
+        try:
+            return await summarize_meeting_json(transcript)  # composer is async
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response else None
+            if code in (429, 500, 502, 503):
+                last_err = f"{code}: {e}"
+                await asyncio.sleep(delay)
+                continue
+            # non-retryable error
+            raise
+        except Exception as e:
+            # network/timeout → retry
+            last_err = str(e)
+            await asyncio.sleep(delay)
+            continue
+    # give up
+    return {"raw_summary_text": f"[summary unavailable after retries] {last_err or ''}".strip()}
 
 @router.post("/summarize")
 async def summarize(
@@ -64,56 +80,20 @@ async def summarize(
         """), {"m": meeting_id}).mappings().all()
 
     if not rows:
-        # --- Optional fallback path using Gemini (audio-only) ---
-        if USE_GEMINI_FALLBACK and summarize_video is not None:
-            with db.engine.begin() as con:
-                m = con.execute(sqltext("SELECT video_url FROM meetings WHERE id=:m"), {"m": meeting_id}).first()
-            if not m or not m.video_url:
-                raise HTTPException(409, "No utterances found for this meeting_id. Run ingest/transcription first.")
-            sv = summarize_video(
-                m.video_url,
-                workdir=f"./vproc/{meeting_id}",
-                audio_only=True
-            )
-            summary_raw = {"raw_summary_text": sv.get("summary_text", "")}
-            normalized = _normalize_summary(summary_raw)
-            # upsert summary payload
-            try:
-                with db.engine.begin() as con:
-                    con.execute(sqltext("""
-                        INSERT INTO summaries (meeting_id, payload)
-                        VALUES (:m, CAST(:p AS jsonb))
-                        ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
-                    """), {"m": meeting_id, "p": json.dumps(summary_raw)})
-            except IntegrityError:
-                with db.engine.begin() as con:
-                    con.execute(sqltext("""
-                        INSERT INTO meetings (id, title, consent, status)
-                        VALUES (:id, 'Untitled', true, 'created')
-                        ON CONFLICT (id) DO NOTHING
-                    """), {"id": meeting_id})
-                    con.execute(sqltext("""
-                        INSERT INTO summaries (meeting_id, payload)
-                        VALUES (:m, CAST(:p AS jsonb))
-                        ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
-                    """), {"m": meeting_id, "p": json.dumps(summary_raw)})
-
-            if HAS_INDEXER:
-                try:
-                    await index_summary(meeting_id, normalized)
-                except Exception:
-                    pass
-
-            return normalized
-
-        # --- Default: fail fast, so the UI can prompt user to ingest/transcribe first
         raise HTTPException(409, "No utterances found for this meeting_id. Run ingest/transcription first.")
 
     transcript = "\n".join(
         f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}" for r in rows
     )
 
-    summary_raw = await summarize_meeting_json(transcript)
+    # 🔁 Retry on 429/5xx so we don't crash the endpoint
+    try:
+        summary_raw = await _summarize_with_retries(transcript)
+    except httpx.HTTPStatusError as e:
+        # If something non-retryable bubbles up, return a clear error to the UI
+        code = e.response.status_code if e.response else 500
+        raise HTTPException(code, f"Summarization failed: {e}")
+
     if isinstance(summary_raw, dict):
         summary_raw["meeting_id"] = meeting_id
     normalized = _normalize_summary(summary_raw)
@@ -144,5 +124,12 @@ async def summarize(
             await index_summary(meeting_id, normalized)
         except Exception:
             pass
+
+    # Best-effort status bump
+    try:
+        with db.engine.begin() as con:
+            con.execute(sqltext("UPDATE meetings SET status='summary_ready' WHERE id=:m"), {"m": meeting_id})
+    except Exception:
+        pass
 
     return normalized

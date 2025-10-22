@@ -1,66 +1,137 @@
-import { useEffect, useRef, useState } from "react";
-import { chat } from "../lib/api";
+// src/pages/Chat.jsx
+import { useState, useRef, useEffect } from "react";
+import { chat as chatApi } from "../lib/api";
+import { useMeeting } from "../context/MeetingContext";
 
 export default function Chat() {
-  const [messages, setMessages] = useState([
-    { role: "ai", text: "Ask about decisions, action items, or topics from your meeting." }
-  ]);
-  const [q, setQ] = useState("");
+  const { meetingId, chatMessages, appendChat } = useMeeting();
+  const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [meetingId, setMeetingId] = useState("");
-  const scrollRef = useRef(null);
-
-  useEffect(() => {
-    setMeetingId(localStorage.getItem("meetingId") || "");
-  }, []);
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+  const [err, setErr] = useState("");
+  const chatRef = useRef(null);
 
   const send = async () => {
-    if (!q.trim() || busy) return;
-    const userText = q; setQ("");
-    setMessages(m => [...m, { role: "user", text: userText }]);
-
     if (!meetingId) {
-      setMessages(m => [...m, { role: "ai", text: "No meeting yet — upload on the Dashboard first." }]);
+      setErr("No meeting selected.");
       return;
     }
+    if (!input.trim() || busy) return;
+
+    setErr("");
+    const content = input.trim();
+    appendChat({ role: "user", content });
+    setBusy(true);
+    setInput("");
+
     try {
-      setBusy(true);
-      const { answer, citations } = await chat(meetingId, userText);
-      setMessages(m => [...m, { role: "ai", text: answer || "(no answer)", citations }]);
+      const r = await chatApi(meetingId, content, 6);
+      appendChat({
+        role: "assistant",
+        content: r?.answer || "(no answer)",
+        sources: r?.sources || [],
+      });
     } catch (e) {
-      setMessages(m => [...m, { role: "ai", text: `Error: ${e.message}` }]);
-    } finally { setBusy(false); }
+      appendChat({
+        role: "assistant",
+        content: e?.message || "Request failed.",
+      });
+    } finally {
+      setBusy(false);
+    }
   };
 
+  useEffect(() => {
+    if (chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight;
+    }
+  }, [chatMessages]);
+
   return (
-    <div className="max-w-6xl mx-auto py-10 px-6">
-      <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-6 flex flex-col">
-        <h2 className="text-2xl font-semibold text-[#4C2E91] mb-2">Auralink Chat</h2>
-        <div ref={scrollRef} className="flex-1 overflow-y-auto space-y-3 mb-4 min-h-[360px] max-h-[60vh] border border-gray-200 rounded-md p-4 bg-white">
-          {messages.map((m, i) => (
-            <div key={i}
-              className={`rounded-2xl px-4 py-2 max-w-[75%] ${m.role === "user" ? "ml-auto bg-[#4C2E91] text-white" : "mr-auto bg-gray-100 text-gray-900"}`}>
-              <div className="whitespace-pre-wrap text-sm">{m.text}</div>
-              {m.citations?.length > 0 && (
-                <div className="text-xs text-gray-500 mt-2 space-y-1">
-                  {m.citations.map((c, j) => (<div key={j}>• {c.start ?? "?"}–{c.end ?? "?"}s — {c.text || "citation"}</div>))}
-                </div>
+    <div className="page">
+      {/* Header (shared) */}
+      <div className="page-header">
+        <h2 className="page-header-title">Chat</h2>
+        <p className="page-header-subtitle">Ask about this meeting’s content.</p>
+      </div>
+
+      {/* Chat area */}
+      <div
+        ref={chatRef}
+        className="rounded-3xl border border-[#E0D6FA] bg-white p-6 h-[64vh] overflow-y-auto shadow-sm hover:shadow-md transition"
+      >
+        {chatMessages.length === 0 ? (
+          <div className="text-center text-gray-500 pt-32">
+            Ask anything about this meeting.
+          </div>
+        ) : (
+          chatMessages.map((m, i) => (
+            <div
+              key={i}
+              className={`mb-5 ${m.role === "user" ? "text-right" : "text-left"}`}
+            >
+              <div
+                className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl shadow-sm whitespace-pre-wrap ${
+                  m.role === "user"
+                    ? "bg-[#5B21B6] text-white rounded-br-none"
+                    : "bg-white border border-gray-100 text-gray-800 rounded-bl-none"
+                }`}
+              >
+                {m.content}
+              </div>
+
+              {m.sources?.length > 0 && (
+                <details className="mt-2 text-left">
+                  <summary className="text-xs text-gray-500 cursor-pointer">Sources</summary>
+                  <ul className="pl-5 list-disc text-xs text-gray-600">
+                    {m.sources.map((s, idx) => (
+                      <li key={idx}>
+                        [{s.t}] {s.speaker}: {s.text.slice(0, 160)}
+                        {s.text.length > 160 ? "…" : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
               )}
             </div>
-          ))}
-        </div>
-        <div className="flex gap-2 items-center">
-          <input className="w-full border border-gray-300 rounded-md px-3 py-2"
-                 placeholder="Ask about this meeting…" value={q}
-                 onChange={(e)=>setQ(e.target.value)} onKeyDown={(e)=>e.key==="Enter" && send()} />
-          <button className="inline-flex items-center justify-center rounded-md bg-[#4C2E91] px-4 py-2 text-white hover:opacity-90 transition disabled:opacity-60"
-                  disabled={busy} onClick={send}>
-            {busy ? "Sending…" : "Send"}
-          </button>
-        </div>
+          ))
+        )}
+      </div>
+
+      {/* Input box — purple focus border */}
+      <div className="flex items-center gap-3 rounded-3xl border border-[#E0D6FA] bg-white shadow-sm p-2 focus-within:border-[#6D28D9] transition">
+        <textarea
+          className="flex-1 resize-none border-none focus:ring-0 text-sm text-gray-800 placeholder-gray-400 rounded-2xl px-3 py-2 focus:outline-none"
+          rows={1}
+          placeholder="Type a question…"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        />
+        <button
+          onClick={send}
+          disabled={busy || !input.trim()}
+          className={`px-5 py-2.5 text-sm font-semibold rounded-2xl text-white shadow-md transition ${
+            busy || !input.trim()
+              ? "bg-gray-300 cursor-not-allowed"
+              : "bg-[#6D28D9] hover:bg-[#5B21B6]"
+          }`}
+        >
+          {busy ? "Thinking…" : "Send"}
+        </button>
+      </div>
+
+      {err && <div className="text-sm text-red-600 text-center">{err}</div>}
+
+      <div className="text-center text-xs text-gray-400 pt-4">
+        <hr className="mb-4 border-gray-200" />
+        <p>
+          © 2025 <span className="font-semibold text-[#5B21B6]">Auralink</span>. All rights reserved.
+        </p>
       </div>
     </div>
   );

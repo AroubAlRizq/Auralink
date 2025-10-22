@@ -1,70 +1,108 @@
 # app/utils/db.py
+from __future__ import annotations
 import os
-from sqlalchemy import create_engine, text
+from typing import Iterable, List, Dict, Any, Optional
+
+from sqlalchemy import create_engine, text as sqltext
 from sqlalchemy.engine import Engine
-from dotenv import load_dotenv
+from sqlalchemy.pool import NullPool
 
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+# Single, lazily-created engine shared across the app.
+# Using NullPool avoids keeping idle connections open to Supabase PgBouncer.
+_ENGINE: Optional[Engine] = None
 
-engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+def _database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL not set")
+    return url
+
+
+def get_engine() -> Engine:
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(
+            _database_url(),
+            # IMPORTANT for Supabase / PgBouncer "session" mode in dev:
+            poolclass=NullPool,        # open/close per .begin() call; prevents pool exhaustion
+            pool_pre_ping=True,        # validates stale conns
+            future=True,
+        )
+    return _ENGINE
+
+
+def dispose_engine() -> None:
+    """Dispose the current engine (used on app shutdown / reload)."""
+    global _ENGINE
+    if _ENGINE is not None:
+        try:
+            _ENGINE.dispose()
+        finally:
+            _ENGINE = None
+
 
 class DB:
-    def __init__(self):
-        self.engine = engine
+    """
+    Thin helper so existing code can do: DB().engine.begin()
+    and also use a few convenience write helpers.
+    """
+    def __init__(self) -> None:
+        self.engine = get_engine()
 
-    # --- meetings
-    def set_meeting_video_url(self, meeting_id: str, video_url: str):
-        with self.engine.begin() as con:
-            con.execute(text("update meetings set video_url=:u where id=:id"),
-                        {"u": video_url, "id": meeting_id})
+    # ----- Convenience helpers used elsewhere -----
 
-    def update_meeting_status(self, meeting_id: str, status: str):
+    def bulk_insert_utterances(self, meeting_id: str, items: Iterable[Dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        count = 0
         with self.engine.begin() as con:
-            con.execute(text("update meetings set status=:s where id=:id"),
-                        {"s": status, "id": meeting_id})
+            for u in items:
+                con.execute(sqltext("""
+                    INSERT INTO utterances (meeting_id, speaker, start_seconds, end_seconds, text)
+                    VALUES (:m, :spk, :ss, :es, :txt)
+                """), {
+                    "m": meeting_id,
+                    "spk": u.get("speaker") or u.get("speaker_label") or "Speaker",
+                    "ss": float(u.get("start_seconds", 0.0)),
+                    "es": float(u.get("end_seconds", 0.0)),
+                    "txt": (u.get("text") or "").strip(),
+                })
+                count += 1
+        return count
 
-    # --- utterances
-    def bulk_insert_utterances(self, meeting_id: str, utts: list[dict]):
-        if not utts: return
-        values_sql = ",".join([f"(:m, :sp{i}, :st{i}, :en{i}, :tx{i})" for i in range(len(utts))])
-        params = {"m": meeting_id}
-        for i, u in enumerate(utts):
-            params[f"sp{i}"] = u["speaker"]
-            params[f"st{i}"] = float(u["start_seconds"])
-            params[f"en{i}"] = float(u["end_seconds"])
-            params[f"tx{i}"] = u["text"]
+    def update_meeting_status(self, meeting_id: str, status: str) -> None:
         with self.engine.begin() as con:
-            con.execute(text(f"""
-                insert into utterances (meeting_id, speaker, start_seconds, end_seconds, text)
-                values {values_sql}
-            """), params)
+            con.execute(sqltext("""
+                UPDATE meetings SET status=:s WHERE id=:m
+            """), {"s": status, "m": meeting_id})
 
-    # --- asr_jobs: NOTE the column is job_id (not id)
-    def upsert_asr_job(self, job_id: str, meeting_id: str, provider: str, status: str,
-                       callback_url: str | None = None, raw=None, error: str | None = None):
+    def update_asr_job(self, job_id: str, *, status: str, raw: Any | None = None, error: str | None = None) -> None:
         with self.engine.begin() as con:
-            con.execute(text("""
-                insert into asr_jobs (job_id, meeting_id, provider, status, callback_url, raw, error)
-                values (:id, :m, :p, :s, :cb, to_jsonb(:raw::text), :err)
-                on conflict (job_id) do update set
-                  meeting_id=excluded.meeting_id,
-                  provider=excluded.provider,
-                  status=excluded.status,
-                  callback_url=excluded.callback_url,
-                  raw=excluded.raw,
-                  error=excluded.error
-            """), {"id": job_id, "m": meeting_id, "p": provider, "s": status,
-                   "cb": callback_url, "raw": str(raw) if raw is not None else None, "err": error})
+            con.execute(sqltext("""
+                INSERT INTO asr_jobs (job_id, status, error, raw)
+                VALUES (:id, :st, :err, CAST(:raw AS jsonb))
+                ON CONFLICT (job_id) DO UPDATE
+                    SET status=EXCLUDED.status,
+                        error=EXCLUDED.error,
+                        raw=EXCLUDED.raw
+            """), {"id": job_id, "st": status, "err": error, "raw": None if raw is None else str(raw)})
 
-    def update_asr_job(self, job_id: str, status: str, raw=None, error: str | None = None):
+    def upsert_asr_job(self, *, job_id: str, meeting_id: str, provider: str, status: str, callback_url: str | None) -> None:
         with self.engine.begin() as con:
-            con.execute(text("""
-                update asr_jobs
-                set status=:s,
-                    raw = coalesce(raw, to_jsonb(:raw::text)),
-                    error = coalesce(:err, error)
-                where job_id=:id
-            """), {"id": job_id, "s": status, "raw": str(raw) if raw is not None else None, "err": error})
+            con.execute(sqltext("""
+                INSERT INTO asr_jobs (job_id, meeting_id, provider, status, callback_url)
+                VALUES (:id, :m, :p, :s, :cb)
+                ON CONFLICT (job_id) DO UPDATE
+                    SET meeting_id=EXCLUDED.meeting_id,
+                        provider=EXCLUDED.provider,
+                        status=EXCLUDED.status,
+                        callback_url=EXCLUDED.callback_url
+            """), {"id": job_id, "m": meeting_id, "p": provider, "s": status, "cb": callback_url})
+
+    def meeting_id_from_job(self, job_id: str) -> str | None:
+        with self.engine.begin() as con:
+            row = con.execute(sqltext("""
+                SELECT meeting_id FROM asr_jobs WHERE job_id=:id
+            """), {"id": job_id}).first()
+        return row[0] if row else None

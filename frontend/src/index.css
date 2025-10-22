@@ -1,19 +1,65 @@
 @import "tailwindcss";
 
-html, body, #root { height: 100%; background: #ffffff; color: #111827; }
+/* ---------------- Base ---------------- */
+html, body, #root {
+  height: 100%;
+  background: #ffffff;
+  color: #111827;
+}
 
-.card  { @apply bg-white border border-gray-200 rounded-xl p-6 shadow-sm hover:shadow-md transition; }
-.btn   { @apply inline-flex items-center justify-center rounded-md px-4 py-2 text-white transition; }
-.input { @apply w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none; }
+/* ---------------- Page Layout ---------------- */
+.page {
+  @apply max-w-6xl mx-auto py-10 px-6 space-y-6;
+}
 
-.btn--primary       { background-color: #4C2E91; }   /* purple */
-.btn--primary:hover { background-color: #1A237E; }   /* deep blue */
-.focus-ring-teal:focus { box-shadow: 0 0 0 2px #00BFA5 inset; }
+/* ---------------- Navbar ---------------- */
+.header-bar {
+  background-color: #5531B0; /* Purple tone */
+  color: #fff;
+  height: 80px; /* fixed height */
+}
 
-.header-bar { background-color: #4C2E91; color: #fff; }
+.header-inner {
+  max-width: 72rem; /* same as max-w-6xl */
+  margin: 0 auto;
+  padding: 0 1.5rem; /* px-6 */
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
 
-.h-title { color:#1A237E; }     /* deep purple for headers */
+.nav-logo {
+  height: 56px; /* logo size */
+  width: auto;
+  object-fit: contain;
+  display: block;
+}
 
+/* ---------------- Buttons ---------------- */
+.btn {
+  @apply inline-flex items-center justify-center rounded-2xl px-4 py-2 font-semibold text-white transition;
+}
 
-.chat-bubble-ai   { @apply bg-gray-100 text-gray-900; }
-.chat-bubble-user { background:#4C2E91; color:#fff; }
+.btn--primary {
+  background-color: #5531B0;
+}
+.btn--primary:hover {
+  background-color: #5E3DC2;
+}
+.btn--primary:disabled {
+  @apply bg-gray-300 cursor-not-allowed;
+}
+
+/* ---------------- Header Section (page-header) ---------------- */
+.page-header {
+  @apply rounded-3xl bg-gradient-to-r from-[#4C1DBA] via-[#5B21B6] to-[#6D28D9] p-6 shadow-md text-white;
+}
+
+.page-header-title {
+  @apply text-2xl md:text-3xl font-semibold mb-1;
+}
+
+.page-header-subtitle {
+  @apply text-white/85 text-sm;
+}

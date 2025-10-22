@@ -1,5 +1,5 @@
+# app/utils/db.py
 import os
-from typing import Optional
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from dotenv import load_dotenv
@@ -11,20 +11,11 @@ if not DATABASE_URL:
 
 engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 
-
 class DB:
     def __init__(self):
         self.engine = engine
 
-    # Meetings
-    def create_meeting(self, title: str, consent: bool) -> str:
-        with self.engine.begin() as con:
-            r = con.execute(
-                text("insert into meetings (title, consent) values (:t,:c) returning id"),
-                {"t": title, "c": consent},
-            )
-            return str(r.scalar_one())
-
+    # --- meetings
     def set_meeting_video_url(self, meeting_id: str, video_url: str):
         with self.engine.begin() as con:
             con.execute(text("update meetings set video_url=:u where id=:id"),
@@ -35,7 +26,7 @@ class DB:
             con.execute(text("update meetings set status=:s where id=:id"),
                         {"s": status, "id": meeting_id})
 
-    # Utterances (batch insert)
+    # --- utterances
     def bulk_insert_utterances(self, meeting_id: str, utts: list[dict]):
         if not utts: return
         values_sql = ",".join([f"(:m, :sp{i}, :st{i}, :en{i}, :tx{i})" for i in range(len(utts))])
@@ -51,14 +42,14 @@ class DB:
                 values {values_sql}
             """), params)
 
-    # ASR jobs
+    # --- asr_jobs: NOTE the column is job_id (not id)
     def upsert_asr_job(self, job_id: str, meeting_id: str, provider: str, status: str,
                        callback_url: str | None = None, raw=None, error: str | None = None):
         with self.engine.begin() as con:
             con.execute(text("""
-                insert into asr_jobs (id, meeting_id, provider, status, callback_url, raw, error)
+                insert into asr_jobs (job_id, meeting_id, provider, status, callback_url, raw, error)
                 values (:id, :m, :p, :s, :cb, to_jsonb(:raw::text), :err)
-                on conflict (id) do update set
+                on conflict (job_id) do update set
                   meeting_id=excluded.meeting_id,
                   provider=excluded.provider,
                   status=excluded.status,
@@ -75,10 +66,5 @@ class DB:
                 set status=:s,
                     raw = coalesce(raw, to_jsonb(:raw::text)),
                     error = coalesce(:err, error)
-                where id=:id
+                where job_id=:id
             """), {"id": job_id, "s": status, "raw": str(raw) if raw is not None else None, "err": error})
-
-    def meeting_id_from_job(self, job_id: str) -> str | None:
-        with self.engine.begin() as con:
-            r = con.execute(text("select meeting_id from asr_jobs where id=:id"), {"id": job_id}).scalar()
-            return str(r) if r else None

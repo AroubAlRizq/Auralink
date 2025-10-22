@@ -1,5 +1,6 @@
 import os, asyncpg, httpx
 from typing import List, Dict
+from app.rag.retriever import *
 
 DB = os.getenv("DATABASE_URL")
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER","cohere")

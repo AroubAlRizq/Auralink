@@ -1,130 +1,148 @@
 # app/api/summarize.py
-from fastapi import APIRouter, Query, UploadFile, File, HTTPException
+from fastapi import APIRouter, Query, HTTPException
 from sqlalchemy import text as sqltext
-import os, tempfile, uuid, json
+from sqlalchemy.exc import IntegrityError
+import os, json
 
 from app.rag.composer import summarize_meeting_json
-from app.models.video_audio_summarizer import summarize_video as mm_summarize
 from app.utils.db import DB
 
-# ✅ auto-index service (for summary bullets; transcript is auto-indexed in webhook)
-from app.rag.indexer_service import index_summary
-
-# Optional multimodal window indexer if you implemented it
 try:
-    from app.rag.indexer import index_mm_windows
-    HAS_MM_INDEXER = True
+    from app.rag.indexer_service import index_summary
+    HAS_INDEXER = True
 except Exception:
-    HAS_MM_INDEXER = False
+    HAS_INDEXER = False
+
+# --- Optional: only used if you want a fallback without utterances
+USE_GEMINI_FALLBACK = os.getenv("USE_GEMINI_FALLBACK", "false").lower() in {"1","true","yes"}
+if USE_GEMINI_FALLBACK:
+    try:
+        from app.models.video_audio_summarizer import summarize_video
+    except Exception:
+        summarize_video = None
+        USE_GEMINI_FALLBACK = False
 
 router = APIRouter(tags=["summarize"])
 
+def _normalize_summary(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"overview": "", "key_points": [], "decisions": [], "action_items": []}
+
+    exec_sum = payload.get("executive_summary")
+    if isinstance(exec_sum, list):
+        overview = " ".join([str(x).strip() for x in exec_sum if x])
+    elif isinstance(exec_sum, str):
+        overview = exec_sum.strip()
+    else:
+        overview = (payload.get("overview") or payload.get("raw_summary_text") or payload.get("summary") or "").strip()
+
+    key_points = payload.get("key_points")
+    if not isinstance(key_points, list):
+        key_points = payload.get("key_events") if isinstance(payload.get("key_events"), list) else []
+
+    decisions = payload.get("decisions") if isinstance(payload.get("decisions"), list) else []
+    action_items = payload.get("action_items") if isinstance(payload.get("action_items"), list) else []
+
+    return {"overview": overview, "key_points": key_points, "decisions": decisions, "action_items": action_items}
+
 @router.post("/summarize")
 async def summarize(
-    mode: str = Query("text", pattern="^(text|multimodal)$"),
+    mode: str = Query("text", pattern="^(text)$"),
     meeting_id: str | None = Query(None),
-    video_file: UploadFile | None = File(None),
-    fps: int = Query(2),
-    window: int = Query(30),
-    max_images: int = Query(60),
-    model: str | None = Query(None)
 ):
-    if mode == "text":
-        if not meeting_id:
-            raise HTTPException(400, "meeting_id is required for text mode.")
+    if not meeting_id:
+        raise HTTPException(400, "meeting_id is required.")
 
-        db = DB()
-        # Build transcript from utterances
-        with db.engine.begin() as con:
-            rows = con.execute(sqltext("""
-                SELECT speaker, start_seconds, end_seconds, text
-                FROM utterances
-                WHERE meeting_id = :m
-                ORDER BY start_seconds
-            """), {"m": meeting_id}).mappings().all()
+    db = DB()
+    # Build transcript from utterances
+    with db.engine.begin() as con:
+        rows = con.execute(sqltext("""
+            SELECT speaker, start_seconds, end_seconds, text
+            FROM utterances
+            WHERE meeting_id = :m
+            ORDER BY start_seconds
+        """), {"m": meeting_id}).mappings().all()
 
-        transcript = "\n".join([f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}" for r in rows])
+    if not rows:
+        # --- Optional fallback path using Gemini (audio-only) ---
+        if USE_GEMINI_FALLBACK and summarize_video is not None:
+            with db.engine.begin() as con:
+                m = con.execute(sqltext("SELECT video_url FROM meetings WHERE id=:m"), {"m": meeting_id}).first()
+            if not m or not m.video_url:
+                raise HTTPException(409, "No utterances found for this meeting_id. Run ingest/transcription first.")
+            sv = summarize_video(
+                m.video_url,
+                workdir=f"./vproc/{meeting_id}",
+                audio_only=True
+            )
+            summary_raw = {"raw_summary_text": sv.get("summary_text", "")}
+            normalized = _normalize_summary(summary_raw)
+            # upsert summary payload
+            try:
+                with db.engine.begin() as con:
+                    con.execute(sqltext("""
+                        INSERT INTO summaries (meeting_id, payload)
+                        VALUES (:m, CAST(:p AS jsonb))
+                        ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
+                    """), {"m": meeting_id, "p": json.dumps(summary_raw)})
+            except IntegrityError:
+                with db.engine.begin() as con:
+                    con.execute(sqltext("""
+                        INSERT INTO meetings (id, title, consent, status)
+                        VALUES (:id, 'Untitled', true, 'created')
+                        ON CONFLICT (id) DO NOTHING
+                    """), {"id": meeting_id})
+                    con.execute(sqltext("""
+                        INSERT INTO summaries (meeting_id, payload)
+                        VALUES (:m, CAST(:p AS jsonb))
+                        ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
+                    """), {"m": meeting_id, "p": json.dumps(summary_raw)})
 
-        # Summarize → strict JSON
-        summary_json = summarize_meeting_json(transcript)
-        summary_json["meeting_id"] = meeting_id  # helpful for downstream
+            if HAS_INDEXER:
+                try:
+                    await index_summary(meeting_id, normalized)
+                except Exception:
+                    pass
 
-        # Upsert into summaries
+            return normalized
+
+        # --- Default: fail fast, so the UI can prompt user to ingest/transcribe first
+        raise HTTPException(409, "No utterances found for this meeting_id. Run ingest/transcription first.")
+
+    transcript = "\n".join(
+        f"[{r['start_seconds']:.1f}s {r['speaker']}] {r['text']}" for r in rows
+    )
+
+    summary_raw = await summarize_meeting_json(transcript)
+    if isinstance(summary_raw, dict):
+        summary_raw["meeting_id"] = meeting_id
+    normalized = _normalize_summary(summary_raw)
+
+    # Upsert into summaries; if FK fails, auto-create meeting row and retry
+    try:
         with db.engine.begin() as con:
             con.execute(sqltext("""
                 INSERT INTO summaries (meeting_id, payload)
-                VALUES (:m, :p::jsonb)
-                ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
-            """), {"m": meeting_id, "p": json.dumps(summary_json)})
+                VALUES (:m, CAST(:p AS jsonb))
+                ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
+            """), {"m": meeting_id, "p": json.dumps(summary_raw)})
+    except IntegrityError:
+        with db.engine.begin() as con:
+            con.execute(sqltext("""
+                INSERT INTO meetings (id, title, consent, status)
+                VALUES (:id, 'Untitled', true, 'created')
+                ON CONFLICT (id) DO NOTHING
+            """), {"id": meeting_id})
+            con.execute(sqltext("""
+                INSERT INTO summaries (meeting_id, payload)
+                VALUES (:m, CAST(:p AS jsonb))
+                ON CONFLICT (meeting_id) DO UPDATE SET payload = CAST(:p AS jsonb)
+            """), {"m": meeting_id, "p": json.dumps(summary_raw)})
 
-        # ✅ Auto-index summary bullets for RAG
+    if HAS_INDEXER:
         try:
-            await index_summary(meeting_id, summary_json)
+            await index_summary(meeting_id, normalized)
         except Exception:
-            # don't fail the API if indexing fails
             pass
 
-        return summary_json
-
-    # -------- multimodal path --------
-    # get local path
-    if video_file:
-        tmpdir = tempfile.mkdtemp(prefix="mm_")
-        local_video = os.path.join(tmpdir, f"{uuid.uuid4()}_{video_file.filename}")
-        with open(local_video, "wb") as f:
-            f.write(await video_file.read())
-    else:
-        if not meeting_id:
-            raise HTTPException(400, "Provide either video_file or meeting_id for multimodal mode.")
-        db = DB()
-        with db.engine.begin() as con:
-            row = con.execute(sqltext("SELECT video_url FROM meetings WHERE id = :m"), {"m": meeting_id}).first()
-        if not row or not row[0]:
-            raise HTTPException(400, "No stored video_url for this meeting; upload a video_file instead.")
-        local_video = row[0]
-
-    # run Gemini
-    try:
-        res = mm_summarize(
-            video_path=local_video,
-            workdir=os.path.join(tempfile.gettempdir(), f"vproc_{uuid.uuid4().hex[:8]}"),
-            fps=fps,
-            window_s=window,
-            max_imgs_per_chunk=max_images,
-            model_name=model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Multimodal summarization failed: {e}")
-
-    # persist multimodal summary in summaries payload (optional structure)
-    if meeting_id:
-        db = DB()
-        payload = {
-            "meeting_id": meeting_id,
-            "executive_summary": [],
-            "decisions": [],
-            "action_items": [],
-            "risks": [],
-            "followups": [],
-            "multimodal": {
-                "narration_file": res["narration_file"],
-                "summary_file": res["summary_file"],
-                "windows": res["windows"]
-            },
-            "raw_summary_text": res["summary_text"]
-        }
-        with db.engine.begin() as con:
-            con.execute(sqltext("""
-                INSERT INTO summaries (meeting_id, payload)
-                VALUES (:m, :p::jsonb)
-                ON CONFLICT (meeting_id) DO UPDATE SET payload = :p::jsonb
-            """), {"m": meeting_id, "p": json.dumps(payload)})
-
-        # (optional) index multimodal windows if you have a helper
-        if HAS_MM_INDEXER:
-            try:
-                index_mm_windows(meeting_id, res["windows"])
-            except Exception:
-                pass
-
-    return res
+    return normalized

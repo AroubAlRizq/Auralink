@@ -1,44 +1,66 @@
-import { ENDPOINTS } from "../config";
+// src/lib/api.js
+const RAW_BASE = (import.meta?.env?.VITE_API_BASE || "http://127.0.0.1:8000").trim();
+export const API_BASE = RAW_BASE.replace(/\/+$/, "");
 
-async function request(url, options = {}) {
-  const res = await fetch(url, options);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  try { return await res.json(); } catch { return {}; }
+async function j(path, opts = {}) {
+  const url = `${API_BASE}${path}`;
+
+  let body = opts.body;
+  const isPlainObject = body && typeof body === "object" && !(body instanceof FormData) && !(body instanceof Blob);
+  if (isPlainObject) body = JSON.stringify(body);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      ...opts,
+      body,
+      headers: {
+        ...(opts.headers || {}),
+        ...(body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+      },
+    });
+  } catch (e) {
+    throw new Error(`Cannot reach API at ${API_BASE}. ${e?.message || e}`);
+  }
+
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    try {
+      const j = text ? JSON.parse(text) : null;
+      const detail = j?.detail ? (typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail)) : text;
+      throw new Error(detail || `${res.status} ${res.statusText}`);
+    } catch {
+      throw new Error(text || `${res.status} ${res.statusText}`);
+    }
+  }
+  try { return text ? JSON.parse(text) : {}; } catch { return {}; }
 }
 
-// == Upload & Ingest ==
-// DB person: backend /api/ingest must return: { meeting_id: "uuid" }
-export async function ingestFile(file, title = "") {
+export async function ingestByUrl(meetingId, videoUrl) {
+  return j("/api/ingest", { method: "POST", body: { meeting_id: meetingId, video_url: videoUrl } });
+}
+export async function ingestFile(meetingId, file) {
   const fd = new FormData();
-  fd.append("file", file);
-  if (title) fd.append("title", title);
-  return request(ENDPOINTS.ingest, { method: "POST", body: fd });
+  fd.append("meeting_id", meetingId);
+  fd.append("video_file", file);
+  return j("/api/ingest_file", { method: "POST", body: fd });
 }
-
-// == Build vector index ==
-// RAG person: backend /api/index to build embeddings + pgvector
 export async function buildIndex(meetingId) {
-  return request(ENDPOINTS.index, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ meeting_id: meetingId }),
-  });
+  return j("/api/index", { method: "POST", body: { meeting_id: meetingId } });
 }
-
-// == Summary ==
-// DB person: backend /api/summarize should return JSON like:
-// { overview, key_points[], decisions[], action_items[] }
 export async function getSummary(meetingId) {
-  return request(`${ENDPOINTS.summarize}?meeting_id=${encodeURIComponent(meetingId)}`);
+  return j(`/api/summarize?mode=text&meeting_id=${encodeURIComponent(meetingId)}`, { method: "POST" });
 }
-
-// == Chat (RAG) ==
-// RAG person: backend /api/chat should return:
-// { answer: string, citations?: [{start,end,text}] }
-export async function chat(meetingId, query) {
-  return request(ENDPOINTS.chat, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ meeting_id: meetingId, query }),
-  });
+export async function chat(meetingId, question, top_k = 6) {
+  return j("/api/chat", { method: "POST", body: { meeting_id: meetingId, question, top_k } });
+}
+export async function pollAAI(jobId) {
+  if (!jobId) throw new Error("Job ID missing in pollAAI()");
+  return j("/api/aai/poll", { method: "POST", body: { job_id: jobId } });
+}
+export async function listUtterances(meetingId) {
+  return j(`/api/utterances?meeting_id=${encodeURIComponent(meetingId)}`);
+}
+export async function health() {
+  return j("/api/health");
 }

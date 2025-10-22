@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Request, HTTPException
 from app.utils.db import DB
 from app.rag.indexer_service import index_transcript  # ✅ auto-index here
+from app.utils.summarize_now import summarize_now     # ✅ summarize immediately
 import time
 
 router = APIRouter(tags=["webhooks"])
@@ -26,9 +27,11 @@ async def assemblyai_webhook(req: Request):
         db.update_asr_job(job_id, status="error", error=str(payload.get("error")))
         raise HTTPException(500, f"ASR provider error: {payload.get('error')}")
 
+    # Persist status on job even when not completed
+    db.update_asr_job(job_id, status=status, raw=payload)
+
     if status != "completed":
-        db.update_asr_job(job_id, status=status, raw=payload)
-        return {"ok": True}
+        return {"ok": True, "status": status, "job_id": job_id}
 
     if not meeting_id:
         meeting_id = db.meeting_id_from_job(job_id)
@@ -49,17 +52,32 @@ async def assemblyai_webhook(req: Request):
     if ulist:
         db.bulk_insert_utterances(meeting_id, ulist)
     db.update_meeting_status(meeting_id, "asr_done")
-    db.update_asr_job(job_id, status="completed", raw=payload)
 
-    # ✅ Auto-index transcript for RAG
+    # ✅ Auto-index transcript for RAG (best-effort)
     indexed = 0
     try:
         indexed = await index_transcript(meeting_id, ulist)
     except Exception:
-        # keep webhook success even if indexing fails
         pass
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(ulist), "indexed_chunks": indexed}
+    # ✅ Generate & store summary NOW so Timeline is ready
+    summary = summarize_now(meeting_id)
+    summary_ready = bool(
+        summary.get("overview")
+        or summary.get("key_points")
+        or summary.get("decisions")
+        or summary.get("action_items")
+    )
+
+    return {
+        "ok": True,
+        "status": "completed",
+        "job_id": job_id,
+        "meeting_id": meeting_id,
+        "utterances": len(ulist),
+        "indexed_chunks": indexed,
+        "summary_ready": summary_ready,
+    }
 
 @router.post("/asr/webhook/deepgram")
 async def deepgram_webhook(req: Request):
@@ -106,11 +124,28 @@ async def deepgram_webhook(req: Request):
     db.update_meeting_status(meeting_id, "asr_done")
     db.update_asr_job(job_id, status="completed", raw=payload)
 
-    # ✅ Auto-index transcript for RAG
+    # ✅ Auto-index transcript for RAG (best-effort)
     indexed = 0
     try:
         indexed = await index_transcript(meeting_id, utterances)
     except Exception:
         pass
 
-    return {"ok": True, "meeting_id": meeting_id, "utterances": len(utterances), "indexed_chunks": indexed}
+    # ✅ Generate & store summary NOW
+    summary = summarize_now(meeting_id)
+    summary_ready = bool(
+        summary.get("overview")
+        or summary.get("key_points")
+        or summary.get("decisions")
+        or summary.get("action_items")
+    )
+
+    return {
+        "ok": True,
+        "status": "completed",
+        "job_id": job_id,
+        "meeting_id": meeting_id,
+        "utterances": len(utterances),
+        "indexed_chunks": indexed,
+        "summary_ready": summary_ready,
+    }

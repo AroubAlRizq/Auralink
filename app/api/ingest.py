@@ -1,8 +1,8 @@
-
 # app/api/ingest.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, AnyUrl
 import os
+from sqlalchemy import text as sqltext
 from app.utils.db import DB
 from app.utils.asr_clients import start_asr_job
 
@@ -12,33 +12,29 @@ class IngestReq(BaseModel):
     meeting_id: str
     video_url: AnyUrl
 
+def _ensure_meeting(con, meeting_id: str):
+    # Creates a placeholder meeting row if it doesn't exist (prevents FK errors later)
+    con.execute(sqltext("""
+        INSERT INTO meetings (id, title, consent, status)
+        VALUES (:id, 'Untitled', true, 'created')
+        ON CONFLICT (id) DO NOTHING
+    """), {"id": meeting_id})
+
 @router.post("/ingest")
 async def ingest(req: IngestReq):
-    """
-    Store the video URL for a meeting and kick off ASR.
-    The ASR provider will call /api/asr/webhook/<provider> when done.
-    """
     db = DB()
+    with db.engine.begin() as con:
+        _ensure_meeting(con, req.meeting_id)
+        con.execute(sqltext("UPDATE meetings SET video_url=:u, status='asr_started' WHERE id=:id"),
+                    {"u": str(req.video_url), "id": req.meeting_id})
 
-    # Save/Update video_url and mark status
-    try:
-        db.set_meeting_video_url(req.meeting_id, str(req.video_url))
-        db.update_meeting_status(req.meeting_id, "asr_started")
-    except Exception as e:
-        raise HTTPException(400, f"Failed to update meeting: {e}")
-
-    # Build webhook URL (publicly reachable)
-    base = os.getenv("PUBLIC_API_BASE_URL")  # e.g., https://your-api.example.com
-    if not base:
-        # fallback to relative path if behind the same domain (not ideal for providers)
-        base = ""
+    base = os.getenv("PUBLIC_API_BASE_URL", "")
     provider = os.getenv("ASR_PROVIDER", "assemblyai").lower()
-    if provider not in {"assemblyai", "deepgram"}:
+    if provider not in {"assemblyai"}:
         raise HTTPException(400, f"Unsupported ASR_PROVIDER: {provider}")
 
-    webhook_url = f"{base}/api/asr/webhook/{provider}" if base else f"/api/asr/webhook/{provider}"
+    webhook_url = f"{base}/api/asr/webhook/{provider}" if base else None
 
-    # Start job at provider (include meeting_id in metadata when possible)
     try:
         job_id = await start_asr_job(
             media_url=str(req.video_url),
@@ -47,19 +43,24 @@ async def ingest(req: IngestReq):
             webhook_url=webhook_url,
         )
     except Exception as e:
-        db.update_meeting_status(req.meeting_id, "error")
+        with db.engine.begin() as con:
+            con.execute(sqltext("UPDATE meetings SET status='error' WHERE id=:id"),
+                        {"id": req.meeting_id})
         raise HTTPException(500, f"ASR job start failed: {e}")
 
-    # Track job
+    # track job id
     try:
-        db.upsert_asr_job(
-            job_id=job_id,
-            meeting_id=req.meeting_id,
-            provider=provider,
-            status="processing",
-            callback_url=webhook_url,
-        )
+        with db.engine.begin() as con:
+            con.execute(sqltext("""
+                INSERT INTO asr_jobs (job_id, meeting_id, provider, status, callback_url)
+                VALUES (:jid, :m, :p, 'processing', :cb)
+                ON CONFLICT (job_id) DO UPDATE
+                  SET meeting_id=excluded.meeting_id,
+                      provider=excluded.provider,
+                      status=excluded.status,
+                      callback_url=excluded.callback_url
+            """), {"jid": job_id, "m": req.meeting_id, "p": provider, "cb": webhook_url})
     except Exception:
-        pass  # non-fatal
+        pass
 
     return {"meeting_id": req.meeting_id, "status": "asr_started", "job_id": job_id}
